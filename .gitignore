@@ -2,3 +2,4 @@ __pycache__/
 bigbird/model
 bigbird/NER_token
 bigbird/trained_model
+bigbird/.ipynb_checkpoints
