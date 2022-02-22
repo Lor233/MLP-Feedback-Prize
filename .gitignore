@@ -3,3 +3,4 @@ bigbird/model
 bigbird/NER_token
 bigbird/trained_model
 bigbird/.ipynb_checkpoints
+bigbird/trained_model_kaggle
