@@ -4,3 +4,7 @@ bigbird/NER_token
 bigbird/trained_model
 bigbird/.ipynb_checkpoints
 bigbird/trained_model_kaggle
+bigbird/sen-word_models
+bigbird/word_e5_sen_e3
+bigbird/word_e5_sen_e5
+bigbird/word_models
