@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--output", type=str, default="model", required=False)
-    parser.add_argument("--input", type=str, default="../data", required=False)
+    parser.add_argument("--input", type=str, default="../input/feedback-prize-2021", required=False)
     parser.add_argument("--max_len", type=int, default=1024, required=False)
     parser.add_argument("--batch_size", type=int, default=8, required=False)
     parser.add_argument("--valid_batch_size", type=int, default=8, required=False)
@@ -218,7 +218,7 @@ if __name__ == "__main__":
     args = parse_args()
     seed_everything(42)
     os.makedirs(args.output, exist_ok=True)
-    df = pd.read_csv(os.path.join(args.input, "train_folds.csv"))
+    df = pd.read_csv('../input/longtexttokenclassification/train_folds.csv')
 
     train_df = df[df["kfold"] != args.fold].reset_index(drop=True)
     valid_df = df[df["kfold"] == args.fold].reset_index(drop=True)
