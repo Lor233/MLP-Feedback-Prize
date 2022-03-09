@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import torch
 from joblib import Parallel, delayed
+from tez import enums
+from tez.callbacks import Callback
 from tqdm import tqdm
 
 target_id_map = {
@@ -30,7 +32,7 @@ target_id_map = {
 id_target_map = {v: k for k, v in target_id_map.items()}
 
 
-def _prepare_training_data_helper(args, mode, tokenizer, df, train_ids):
+def _prepare_training_data_helper(args, tokenizer, df, train_ids):
     training_samples = []
     for idx in tqdm(train_ids):
         filename = os.path.join(args.input, "train", idx + ".txt")
@@ -90,12 +92,7 @@ def _prepare_training_data_helper(args, mode, tokenizer, df, train_ids):
             input_labels_sep.append(label)
             if i in dotpos:
                 input_ids_sep.append(2)
-                if mode == 'train':
-                    input_labels_sep.append(dotner[dotpos.index(i)])
-                elif mode == 'test':
-                    input_labels_sep.append(dotner[dotpos.index(i)])
-                    # input_labels_sep.append("O")
-                    # input_labels_sep.append("PAD")
+                input_labels_sep.append(dotner[dotpos.index(i)])
 
         sample["input_ids"] = input_ids_sep
         sample["input_labels"] = input_labels_sep
@@ -103,14 +100,14 @@ def _prepare_training_data_helper(args, mode, tokenizer, df, train_ids):
     return training_samples
 
 
-def prepare_training_data(mode, df, tokenizer, args, num_jobs):
+def prepare_training_data(df, tokenizer, args, num_jobs):
     training_samples = []
     train_ids = df["id"].unique()
 
     train_ids_splits = np.array_split(train_ids, num_jobs)
 
     results = Parallel(n_jobs=num_jobs, backend="multiprocessing")(
-        delayed(_prepare_training_data_helper)(args, mode, tokenizer, df, idx) for idx in train_ids_splits
+        delayed(_prepare_training_data_helper)(args, tokenizer, df, idx) for idx in train_ids_splits
     )
     for result in results:
         training_samples.extend(result)
@@ -260,129 +257,178 @@ class Collate:
 
         return output
 
-def evaluate(model, valid_samples, tokenizer, batch_size, valid_df, mode):
-    model.eval()
-    valid_dataset = FeedbackDatasetValid(valid_samples, 4096, tokenizer)
-    collate = Collate(tokenizer)
 
-    preds_iter = model.predict(
-        valid_dataset,
-        batch_size=batch_size,
-        n_jobs=-1,
-        collate_fn=collate,
-    )
+class EarlyStopping(Callback):
+    def __init__(
+        self,
+        model_path,
+        valid_df,
+        valid_samples,
+        batch_size,
+        tokenizer,
+        patience=5,
+        mode="max",
+        delta=0.001,
+        save_weights_only=True,
+    ):
+        self.patience = patience
+        self.counter = 0
+        self.mode = mode
+        self.best_score = None
+        self.early_stop = False
+        self.delta = delta
+        self.save_weights_only = save_weights_only
+        self.model_path = model_path
+        self.valid_samples = valid_samples
+        self.batch_size = batch_size
+        self.valid_df = valid_df
+        self.tokenizer = tokenizer
 
-    final_preds = []
-    final_scores = []
-    for preds in preds_iter:
-        pred_class = np.argmax(preds, axis=2)
-        pred_scrs = np.max(preds, axis=2)
-        for pred, pred_scr in zip(pred_class, pred_scrs):
-            final_preds.append(pred.tolist())
-            final_scores.append(pred_scr.tolist())
+        if self.mode == "min":
+            self.val_score = np.Inf
+        else:
+            self.val_score = -np.Inf
 
-    for j in range(len(valid_samples)):
-        tt = [id_target_map[p] for p in final_preds[j][1:]]
-        tt_score = final_scores[j][1:]
-        valid_samples[j]["preds"] = tt
-        valid_samples[j]["pred_scores"] = tt_score
+    def on_epoch_end(self, model):
+        model.eval()
+        valid_dataset = FeedbackDatasetValid(self.valid_samples, 4096, self.tokenizer)
+        collate = Collate(self.tokenizer)
 
-    submission = []
-    min_thresh = {
-        "Lead": 9,
-        "Position": 5,
-        "Evidence": 14,
-        "Claim": 3,
-        "Concluding Statement": 11,
-        "Counterclaim": 6,
-        "Rebuttal": 4,
-    }
-    proba_thresh = {
-        "Lead": 0.7,
-        "Position": 0.55,
-        "Evidence": 0.65,
-        "Claim": 0.55,
-        "Concluding Statement": 0.7,
-        "Counterclaim": 0.5,
-        "Rebuttal": 0.55,
-    }
+        preds_iter = model.predict(
+            valid_dataset,
+            batch_size=self.batch_size,
+            n_jobs=-1,
+            collate_fn=collate,
+        )
 
-    for _, sample in enumerate(valid_samples):
-        preds = sample["preds"]
-        offset_mapping = sample["offset_mapping"]
-        sample_id = sample["id"]
-        sample_text = sample["text"]
-        sample_pred_scores = sample["pred_scores"]
+        final_preds = []
+        final_scores = []
+        for preds in preds_iter:
+            pred_class = np.argmax(preds, axis=2)
+            pred_scrs = np.max(preds, axis=2)
+            for pred, pred_scr in zip(pred_class, pred_scrs):
+                final_preds.append(pred.tolist())
+                final_scores.append(pred_scr.tolist())
 
-        # pad preds to same length as offset_mapping
-        if len(preds) < len(offset_mapping):
-            preds = preds + ["O"] * (len(offset_mapping) - len(preds))
-            sample_pred_scores = sample_pred_scores + [0] * (len(offset_mapping) - len(sample_pred_scores))
+        for j in range(len(self.valid_samples)):
+            tt = [id_target_map[p] for p in final_preds[j][1:]]
+            tt_score = final_scores[j][1:]
+            self.valid_samples[j]["preds"] = tt
+            self.valid_samples[j]["pred_scores"] = tt_score
 
-        idx = 0
-        phrase_preds = []
-        while idx < len(offset_mapping):
-            start, _ = offset_mapping[idx]
-            if preds[idx] != "O":
-                label = preds[idx][2:]
-            else:
-                label = "O"
-            phrase_scores = []
-            phrase_scores.append(sample_pred_scores[idx])
-            idx += 1
+        submission = []
+        min_thresh = {
+            "Lead": 9,
+            "Position": 5,
+            "Evidence": 14,
+            "Claim": 3,
+            "Concluding Statement": 11,
+            "Counterclaim": 6,
+            "Rebuttal": 4,
+        }
+        proba_thresh = {
+            "Lead": 0.7,
+            "Position": 0.55,
+            "Evidence": 0.65,
+            "Claim": 0.55,
+            "Concluding Statement": 0.7,
+            "Counterclaim": 0.5,
+            "Rebuttal": 0.55,
+        }
+
+        for _, sample in enumerate(self.valid_samples):
+            preds = sample["preds"]
+            offset_mapping = sample["offset_mapping"]
+            sample_id = sample["id"]
+            sample_text = sample["text"]
+            sample_pred_scores = sample["pred_scores"]
+
+            # pad preds to same length as offset_mapping
+            if len(preds) < len(offset_mapping):
+                preds = preds + ["O"] * (len(offset_mapping) - len(preds))
+                sample_pred_scores = sample_pred_scores + [0] * (len(offset_mapping) - len(sample_pred_scores))
+
+            idx = 0
+            phrase_preds = []
             while idx < len(offset_mapping):
-                if label == "O":
-                    matching_label = "O"
+                start, _ = offset_mapping[idx]
+                if preds[idx] != "O":
+                    label = preds[idx][2:]
                 else:
-                    matching_label = f"I-{label}"
-                if preds[idx] == matching_label:
-                    _, end = offset_mapping[idx]
-                    phrase_scores.append(sample_pred_scores[idx])
-                    idx += 1
-                else:
-                    break
-            if "end" in locals():
-                phrase = sample_text[start:end]
-                phrase_preds.append((phrase, start, end, label, phrase_scores))
+                    label = "O"
+                phrase_scores = []
+                phrase_scores.append(sample_pred_scores[idx])
+                idx += 1
+                while idx < len(offset_mapping):
+                    if label == "O":
+                        matching_label = "O"
+                    else:
+                        matching_label = f"I-{label}"
+                    if preds[idx] == matching_label:
+                        _, end = offset_mapping[idx]
+                        phrase_scores.append(sample_pred_scores[idx])
+                        idx += 1
+                    else:
+                        break
+                if "end" in locals():
+                    phrase = sample_text[start:end]
+                    phrase_preds.append((phrase, start, end, label, phrase_scores))
 
-        temp_df = []
-        for phrase_idx, (phrase, start, end, label, phrase_scores) in enumerate(phrase_preds):
-            word_start = len(sample_text[:start].split())
-            word_end = word_start + len(sample_text[start:end].split())
-            word_end = min(word_end, len(sample_text.split()))
-            ps = " ".join([str(x) for x in range(word_start, word_end)])
-            if label != "O":
-                if sum(phrase_scores) / len(phrase_scores) >= proba_thresh[label]:
-                    temp_df.append((sample_id, label, ps))
+            temp_df = []
+            for phrase_idx, (phrase, start, end, label, phrase_scores) in enumerate(phrase_preds):
+                word_start = len(sample_text[:start].split())
+                word_end = word_start + len(sample_text[start:end].split())
+                word_end = min(word_end, len(sample_text.split()))
+                ps = " ".join([str(x) for x in range(word_start, word_end)])
+                if label != "O":
+                    if sum(phrase_scores) / len(phrase_scores) >= proba_thresh[label]:
+                        temp_df.append((sample_id, label, ps))
 
-        temp_df = pd.DataFrame(temp_df, columns=["id", "class", "predictionstring"])
+            temp_df = pd.DataFrame(temp_df, columns=["id", "class", "predictionstring"])
 
-        submission.append(temp_df)
+            submission.append(temp_df)
 
-    submission = pd.concat(submission).reset_index(drop=True)
-    submission["len"] = submission.predictionstring.apply(lambda x: len(x.split()))
+        submission = pd.concat(submission).reset_index(drop=True)
+        submission["len"] = submission.predictionstring.apply(lambda x: len(x.split()))
 
-    def threshold(df):
-        df = df.copy()
-        for key, value in min_thresh.items():
-            index = df.loc[df["class"] == key].query(f"len<{value}").index
-            df.drop(index, inplace=True)
-        return df
+        def threshold(df):
+            df = df.copy()
+            for key, value in min_thresh.items():
+                index = df.loc[df["class"] == key].query(f"len<{value}").index
+                df.drop(index, inplace=True)
+            return df
 
-    submission = threshold(submission)
+        submission = threshold(submission)
 
-    # drop len
-    submission = submission.drop(columns=["len"])
+        # drop len
+        submission = submission.drop(columns=["len"])
 
-    scr = score_feedback_comp(submission, valid_df, return_class_scores=True)
-    print(scr)
-    model.train()
+        scr = score_feedback_comp(submission, self.valid_df, return_class_scores=True)
+        print(scr)
+        model.train()
 
-    epoch_score = scr[0]
-    if mode == "min":
-        score = -1.0 * epoch_score
-    else:
-        score = np.copy(epoch_score)
+        epoch_score = scr[0]
+        if self.mode == "min":
+            score = -1.0 * epoch_score
+        else:
+            score = np.copy(epoch_score)
 
-    return score
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(epoch_score, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            print("EarlyStopping counter: {} out of {}".format(self.counter, self.patience))
+            if self.counter >= self.patience:
+                model.model_state = enums.ModelState.END
+        else:
+            self.best_score = score
+            self.save_checkpoint(epoch_score, model)
+            self.counter = 0
+
+    def save_checkpoint(self, epoch_score, model):
+        if epoch_score not in [-np.inf, np.inf, -np.nan, np.nan]:
+            print("Validation score improved ({} --> {}). Saving model!".format(self.val_score, epoch_score))
+            model.save(self.model_path, weights_only=self.save_weights_only)
+        self.val_score = epoch_score
 

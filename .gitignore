@@ -7,3 +7,5 @@ bigbird/.ipynb_checkpoints
 bigbird/trained_model_kaggle
 bigbird/model-large
 bigbird/v5
+bigbird/offset_model
+bigbird/infer-sentence-word-clsfix.ipynb
